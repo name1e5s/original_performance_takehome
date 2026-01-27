@@ -525,6 +525,7 @@ def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> in
     def r(x):
         return x % (2**32)
 
+    trace[(round, batch_i, "hash_stage_start")] = a
     for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
         a = r(fns[op2](r(fns[op1](a, val1)), r(fns[op3](a, val3))))
         trace[(round, batch_i, "hash_stage", i)] = a
@@ -554,6 +555,7 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "val")] = val
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
+            trace[(h, i, "tmp_val")] = val ^ node_val
             val = myhash_traced(val ^ node_val, trace, h, i)
             trace[(h, i, "hashed_val")] = val
             idx = 2 * idx + (1 if val % 2 == 0 else 2)

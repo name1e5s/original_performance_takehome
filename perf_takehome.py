@@ -16,8 +16,11 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
+from dataclasses import dataclass, field
 from collections import defaultdict
+import heapq
 import random
+from typing import DefaultDict
 import unittest
 
 from problem import (
@@ -35,6 +38,316 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+
+ENGINES = ["alu", "valu", "load", "store", "flow", "debug"]
+SLOT_LIMITS = {
+    "alu": 12,
+    "valu": 6,
+    "load": 2,
+    "store": 2,
+    "flow": 1,
+    "debug": 64,
+}
+
+@dataclass
+class Instruction:
+    id: int
+    engine: str
+    slot: tuple
+
+    depends_on: int
+    war_depends_by: list[int]
+    depends_by: list[int]
+
+    depends_on_list: list[int]
+
+    def op(self):
+        return self.slot[0]
+    
+    def addrs_for_alu(self, *slot):
+        assert self.engine == "alu"
+        (op, dest, a1, a2) = slot
+        return [dest], [a1, a2]
+    
+    def addrs_for_valu(self, *slot):
+        addrs_to_write = []
+        addrs_to_read = []
+
+        assert self.engine == "valu"
+        match slot:
+            case ("vbroadcast", dest, src):
+                for i in range(VLEN):
+                    addrs_to_write.append(dest + i)
+                addrs_to_read.append(src)
+            case ("multiply_add", dest, a, b, c):
+                for i in range(VLEN):
+                    addrs_to_write.append(dest + i)
+                    addrs_to_read.append(a + i)
+                    addrs_to_read.append(b + i)
+                    addrs_to_read.append(c + i)
+            case (op, dest, a1, a2):
+                for i in range(VLEN):
+                    addrs_to_write.append(dest + i)
+                    addrs_to_read.append(a1 + i)
+                    addrs_to_read.append(a2 + i)
+            case _:
+                raise NotImplementedError(f"Unknown valu op {slot}")
+        
+        return addrs_to_write, addrs_to_read
+
+    def addrs_for_load(self, *slot):
+        addrs_to_write = []
+        addrs_to_read = []
+
+        assert self.engine == "load"
+        match slot:
+            case ("load", dest, addr):
+                # print(dest, addr, core.scratch[addr])
+                addrs_to_write.append(dest)
+                addrs_to_read.append(addr)
+            case ("load_offset", dest, addr, offset):
+                addrs_to_write.append(dest + offset)
+                addrs_to_read.append(addr + offset)
+            case ("vload", dest, addr):  # addr is a scalar
+                addrs_to_read.append(addr)
+                for vi in range(VLEN):
+                    addrs_to_write.append(dest + vi)
+            case ("const", dest, val):
+                addrs_to_write.append(dest)
+            case _:
+                raise NotImplementedError(f"Unknown load op {slot}")
+
+        return addrs_to_write, addrs_to_read
+
+    def addrs_for_store(self, *slot):
+        addrs_to_write = []
+        addrs_to_read = []
+        match slot:
+            case ("store", addr, src):
+                addrs_to_read.append(addr)
+                addrs_to_read.append(src)
+            case ("vstore", addr, src):  # addr is a scalar
+                addrs_to_read.append(addr)
+                for vi in range(VLEN):
+                    addrs_to_read.append(src + vi)
+            case _:
+                raise NotImplementedError(f"Unknown store op {slot}")
+        
+        return addrs_to_write, addrs_to_read
+
+    def addrs_for_flow(self, *slot):
+        addrs_to_write = []
+        addrs_to_read = []
+
+        match slot:
+            case ("select", dest, cond, a, b):
+                addrs_to_write.append(dest)
+                addrs_to_read.append(cond)
+                addrs_to_read.append(a)
+                addrs_to_read.append(b)
+            case ("add_imm", dest, a, imm):
+                addrs_to_write.append(dest)
+                addrs_to_read.append(a)
+            case ("vselect", dest, cond, a, b):
+                for vi in range(VLEN):
+                    addrs_to_write.append(dest + vi)
+                    addrs_to_read.append(cond + vi)
+                    addrs_to_read.append(a + vi)
+                    addrs_to_read.append(b + vi)
+            case ("halt",):
+                # no-op
+                pass
+            case ("pause",):
+                # no-op
+                pass
+            case ("trace_write", val):
+                addrs_to_read.append(val)
+            case ("cond_jump", cond, addr):
+                addrs_to_read.append(cond)
+            case ("cond_jump_rel", cond, offset):
+                addrs_to_read.append(cond)
+            case ("jump", addr):
+                pass
+            case ("jump_indirect", addr):
+                addrs_to_read.append(addr)
+            case ("coreid", dest):
+                addrs_to_write.append(dest)
+            case _:
+                raise NotImplementedError(f"Unknown flow op {slot}")
+
+        return addrs_to_write, addrs_to_read
+    
+    def addrs_for_debug(self, *slot):
+        addrs_to_write = []
+        addrs_to_read = []
+        match slot:
+            case ("compare", loc, key):
+                addrs_to_read.append(loc)
+            case ("vcompare", loc, keys):
+                for vi in range(VLEN):
+                    addrs_to_read.append(loc + vi)
+            case ("comment", _):
+                pass
+            case _:
+                pass
+        return addrs_to_write, addrs_to_read
+
+    def addrs(self):
+        match self.engine:
+            case "alu":
+                return self.addrs_for_alu(*self.slot)
+            case "valu":
+                return self.addrs_for_valu(*self.slot)
+            case "load":
+                return self.addrs_for_load(*self.slot)
+            case "store":
+                return self.addrs_for_store(*self.slot)
+            case "flow":
+                return self.addrs_for_flow(*self.slot)
+            case "debug":
+                return self.addrs_for_debug(*self.slot)
+            case _:
+                raise NotImplementedError(f"Unknown engine {self.engine}")
+
+
+@dataclass
+class ScoreBoard:
+    last_reads: set = field(default_factory=set)
+    last_write: int = -1
+
+class InstructionScheduler:
+    def __init__(self):
+        self.scoreboard = defaultdict(ScoreBoard)
+        self.instructions: list[Instruction] = []
+    
+    def append(self, instr_raw: tuple[Engine, tuple]):
+        instr = Instruction(
+            id=len(self.instructions),
+            engine=instr_raw[0],
+            slot=instr_raw[1],
+            depends_on=0,
+            war_depends_by=[],
+            depends_by=[],
+            depends_on_list=[],
+        )
+        index = len(self.instructions)
+        self.instructions.append(instr)
+
+        addrs_to_write, addrs_to_read = instr.addrs()
+
+        war_deps: set[int] = set()
+        other_deps: set[int] = set()
+
+        for addr in addrs_to_write:
+            last_reads = self.scoreboard[addr].last_reads
+            # write after read dependency
+            for last_read in last_reads:
+                war_deps.add(last_read)
+
+            last_write = self.scoreboard[addr].last_write
+            # write after write dependency
+            if last_write > -1:
+                other_deps.add(last_write)
+
+        for addr in addrs_to_read:
+            last_write = self.scoreboard[addr].last_write
+            # read after write dependency
+            if last_write > -1:
+                other_deps.add(last_write)
+
+        for dep in war_deps:
+            instr.depends_on += 1
+            instr.depends_on_list.append(dep)
+            self.instructions[dep].war_depends_by.append(index)
+
+        for dep in other_deps:
+            instr.depends_on += 1
+            instr.depends_on_list.append(dep)
+            self.instructions[dep].depends_by.append(index)
+        
+        for addr in addrs_to_read:
+            self.scoreboard[addr].last_reads.add(index)
+
+        for addr in addrs_to_write:
+            self.scoreboard[addr].last_write = index
+            self.scoreboard[addr].last_reads.clear()
+
+        return index
+    
+    def extend(self, instrs: list[tuple[Engine, tuple]]):
+        for instr in instrs:
+            self.append(instr)
+    
+    def schedule(self) -> list[dict[str, list(tuple)]]:
+        if not self.instructions:
+            return []
+
+        current_time = 0
+        instructions_to_schedule = len(self.instructions)
+        bundles: list[dict[str, list(tuple)]] = []
+        # engine -> heap[(ready_at, instr_id)]
+        ready: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        scheduled = set()
+
+        for instr in self.instructions:
+            if instr.depends_on == 0:
+                heapq.heappush(ready[instr.engine], (current_time, instr.id))
+        
+        while instructions_to_schedule > 0:
+            bundle: dict[str, list(tuple)] = {}
+            slot_count: dict[str, int] = defaultdict(int)
+            can_pack_more = True
+
+            for engine in ENGINES:
+                bundle[engine] = []
+
+            while can_pack_more:
+                scheduled_this_cycle: list[int] = []
+
+                for engine in ENGINES:
+                    while (slot_count[engine] < SLOT_LIMITS[engine] and
+                        ready[engine]):
+                        ready_at, instr_id = heapq.heappop(ready[engine])
+                        if ready_at > current_time:
+                            heapq.heappush(ready[engine], (ready_at, instr_id))
+                            break
+
+                        instr = self.instructions[instr_id]
+                        bundle[engine].append(instr.slot)
+                        if instr_id in scheduled:
+                            print(f"Warning: Instruction {instr_id} already scheduled")
+                            exit(1)
+                        scheduled.add(instr_id)
+                        scheduled_this_cycle.append(instr_id)
+                        slot_count[engine] += 1
+                        instructions_to_schedule -= 1
+                
+                # move to next cycle
+                if not scheduled_this_cycle:
+                    can_pack_more = False
+                    break
+                
+                war_deps: list[int] = []
+                other_deps: list[int] = []
+                for instr_id in scheduled_this_cycle:
+                    instr = self.instructions[instr_id]
+                    war_deps.extend(instr.war_depends_by)
+                    other_deps.extend(instr.depends_by)
+
+                deps = [(dep_id, 0) for dep_id in war_deps]
+                deps.extend([(dep_id, 1) for dep_id in other_deps])
+                for (dep_id, delay) in deps:
+                    dep_instr = self.instructions[dep_id]
+                    dep_instr.depends_on -= 1
+                    if dep_instr.depends_on == 0:
+                        heapq.heappush(ready[dep_instr.engine], (current_time + delay, dep_id))
+
+            bundles.append(bundle)
+            current_time += 1
+
+        print(f"Scheduled {len(self.instructions)} instructions in {current_time} cycles {len(scheduled)}")
+
+        return bundles
 
 
 class KernelBuilder:
@@ -77,6 +390,7 @@ class KernelBuilder:
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage_start"))))
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
@@ -123,7 +437,8 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        # body = []  # array of slots
+        body = InstructionScheduler()
 
         # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
@@ -148,6 +463,7 @@ class KernelBuilder:
                 body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
                 # val = myhash(val ^ node_val)
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                body.append(("debug", ("compare", tmp_val, (round, i, "tmp_val"))))
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
@@ -168,8 +484,11 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+        #body_instrs = self.build(body.schedule())
+        self.instrs.extend(body.schedule())
+        # body_instrs = self.build(body)
+        # self.instrs.extend(body_instrs)
+
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
