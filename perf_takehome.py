@@ -429,6 +429,9 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        const_vlen = self.scratch_const(VLEN)
+        const_double_vlen = self.scratch_const(VLEN * 2)
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -441,21 +444,35 @@ class KernelBuilder:
         body = InstructionScheduler()
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
+        v_batch_size = batch_size // VLEN
+        # store indices and values in scratch
+        indices = self.alloc_scratch("indices", batch_size)
+        values = self.alloc_scratch("values", batch_size)
+
+        tmp_addr_0 = self.alloc_scratch("tmp_addr_0")
+        tmp_addr_1 = self.alloc_scratch("tmp_addr_1")
+
+
+        body.append(("flow", ("add_imm", tmp_addr_0, self.scratch["inp_values_p"], 0)))
+        body.append(("flow", ("add_imm", tmp_addr_1, self.scratch["inp_values_p"], VLEN)))
+        for i in range(0, v_batch_size, 2):
+            offset_0 = i * VLEN
+            offset_1 = offset_0 + VLEN
+            body.append(("load", ("vload", values + offset_0, tmp_addr_0)))
+            body.append(("load", ("vload", values + offset_1, tmp_addr_1)))
+            body.append(("alu", ("+", tmp_addr_0, tmp_addr_0, const_double_vlen)))
+            body.append(("alu", ("+", tmp_addr_1, tmp_addr_1, const_double_vlen)))
+
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
+                tmp_idx = indices + i
+                tmp_val = values + i
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
@@ -477,12 +494,15 @@ class KernelBuilder:
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+
+        body.append(("flow", ("add_imm", tmp_addr_0, self.scratch["inp_indices_p"], 0)))
+        body.append(("flow", ("add_imm", tmp_addr_1, self.scratch["inp_values_p"], 0)))
+        for i in range(v_batch_size):
+            offset = i * VLEN
+            body.append(("store", ("vstore", tmp_addr_0, indices + offset)))
+            body.append(("store", ("vstore", tmp_addr_1, values + offset)))
+            body.append(("alu", ("+", tmp_addr_0, tmp_addr_0, const_vlen)))
+            body.append(("alu", ("+", tmp_addr_1, tmp_addr_1, const_vlen)))
 
         #body_instrs = self.build(body.schedule())
         self.instrs.extend(body.schedule())
